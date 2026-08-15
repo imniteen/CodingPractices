@@ -1,0 +1,311 @@
+# TEMPLATE — GitLab CI for a Fargate stack. Skeleton, not drop-in.
+#
+# Read references/pipeline.md and traps.md #10 before editing any `needs:`.
+#
+# Pipeline order is deliberate:  gate -> test -> build -> tf -> migrate -> deploy -> smoke
+#
+# `gate` is FIRST and NOT manual: whatever must never regress in this project blocks everything
+# downstream. Everything that touches AWS is `when: manual` until protected branches are enabled and
+# fork-MR pipelines are blocked (traps.md #9) — the deploy role can PassRole a task role, which means
+# arbitrary code as that role.
+
+variables:
+  APP_NAME: your-app
+  AWS_REGION: us-west-2
+  ENV: nonprod
+  TF_VARS_FILE: <account>-<region>.tfvars
+  ECR_REGISTRY: "<account-id>.dkr.ecr.<region>.amazonaws.com"
+  ECS_CLUSTER: nonprod-your-app
+
+  # Set as yml variables with REAL defaults, not left to project variables alone. An unset role ARN
+  # fails OIDC with "Invalid length for parameter RoleArn, value: 0", which reads like a broken
+  # template rather than a missing variable. Project variables still override yml (lowest precedence).
+  #
+  # Two identities split by blast radius. Their trust policies MUST pin the project path, which is what
+  # makes it safe for the ARNs to live in a committed file.
+  TF_AWS_ROLE_ARN: "arn:aws:iam::<account>:role/<CI-TF-ROLE>"
+  DEPLOY_AWS_ROLE_ARN: "arn:aws:iam::<account>:role/<CI-DEPLOY-ROLE>"
+
+  IMAGE_TAG:
+    value: ""
+    description: "Image tag to build/deploy. Defaults to the commit short SHA when blank. Never 'latest'."
+
+stages:
+  - gate
+  - test
+  - build
+  - tf
+  - migrate
+  - deploy
+  - smoke
+
+# --- path filters ---------------------------------------------------------------------------
+
+.backend-paths: &backend-paths
+  - src/**/*
+  - migrations/**/*
+  - Dockerfile.api
+  - Dockerfile.worker
+
+.frontend-paths: &frontend-paths
+  - frontend/**/*
+  - Dockerfile.frontend
+
+.tf-paths: &tf-paths
+  - terraform/**/*
+
+# --- shared ---------------------------------------------------------------------------------
+
+.resolve-tag: &resolve-tag |
+  if [ -z "${IMAGE_TAG}" ]; then export IMAGE_TAG="${CI_COMMIT_SHORT_SHA}"; fi
+  echo "IMAGE_TAG=${IMAGE_TAG}"
+
+# Registers a new revision of family $1 with image $2 and echoes the new ARN.
+# This is WHY services declare lifecycle.ignore_changes on task_definition.
+# Note the consequence (traps.md #3): because this always overrides the image, CI is immune to the
+# placeholder-tag trap while LOCAL applies are not. "CI works" proves nothing about local applies.
+.ecs-helpers: &ecs-helpers |
+  register_revision() {
+    local family="$1" image="$2"
+    aws ecs describe-task-definition --task-definition "$family" --query 'taskDefinition' --output json \
+      | jq --arg IMG "$image" '
+          .containerDefinitions[0].image = $IMG
+          | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)' \
+      > /tmp/td.json
+    aws ecs register-task-definition --cli-input-json file:///tmp/td.json \
+      --query 'taskDefinition.taskDefinitionArn' --output text
+  }
+
+# ============================================================================================
+# GATE — first, never manual, never skipped
+# ============================================================================================
+
+gate:
+  stage: gate
+  rules:
+    - when: always
+  script:
+    # Whatever must never regress in this project. Keep its dependency install minimal so this
+    # costs seconds — that is what lets it be unconditional.
+    - echo "Running the non-negotiable gate"
+    - make gate   # or: pytest tests/security -q
+
+# ============================================================================================
+# TEST — run every gate LOCALLY before pushing the pipeline that enforces it (traps.md #12)
+# ============================================================================================
+
+unit-tests:
+  stage: test
+  needs: [gate]
+  rules:
+    - changes: *backend-paths
+    - if: $CI_PIPELINE_SOURCE == "web"
+  script:
+    - make test
+    - make lint     # a lint gate never run locally WILL fail the first pipeline
+
+frontend-tests:
+  stage: test
+  needs: [gate]
+  rules:
+    - changes: *frontend-paths
+    - if: $CI_PIPELINE_SOURCE == "web"
+  script:
+    - cd frontend && npm ci && npm run test
+
+terraform-validate:
+  stage: test
+  needs: [gate]
+  rules:
+    - changes: *tf-paths
+    - if: $CI_PIPELINE_SOURCE == "web"
+  script:
+    - cd terraform
+    - terraform fmt -check -recursive
+    - terraform init -backend=false -input=false
+    - terraform validate
+
+# ============================================================================================
+# BUILD
+# ============================================================================================
+#
+# WARNING (traps.md #11): `changes:` rules make these jobs PRESENT in merge-request pipelines. Even
+# `when: manual`, one click pushes an image from an unmerged ref using the deploy role. Audit this
+# before enabling protected branches, not after.
+
+.build-image:
+  stage: build
+  needs: [gate]
+  variables:
+    AWS_ROLE_ARN: $DEPLOY_AWS_ROLE_ARN
+  script:
+    - *resolve-tag
+    - REPO="${ECR_REGISTRY}/${ENV}/${APP_NAME}-${COMPONENT}"
+    - aws ecr get-login-password --region "$AWS_REGION" | buildah login --username AWS --password-stdin "$ECR_REGISTRY"
+    # ARM64 on an ARM runner. Emulated cross-builds are slow enough to change timeout behaviour.
+    - buildah build --platform linux/arm64 -f "$DOCKERFILE" $BUILD_ARGS -t "${REPO}:${IMAGE_TAG}" .
+    - buildah push "${REPO}:${IMAGE_TAG}"
+
+build-api:
+  extends: .build-image
+  variables:
+    COMPONENT: api
+    DOCKERFILE: Dockerfile.api
+  rules:
+    - changes: *backend-paths
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+
+build-frontend:
+  extends: .build-image
+  variables:
+    COMPONENT: frontend
+    DOCKERFILE: Dockerfile.frontend
+    # traps.md #13: build-time config MUST be a --build-arg. A runtime env var is too late — the value
+    # is already inlined into the client bundle. Empty = relative base URL = one image per environment.
+    BUILD_ARGS: --build-arg NEXT_PUBLIC_API_BASE_URL=
+  rules:
+    - changes: *frontend-paths
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+
+# ============================================================================================
+# TERRAFORM
+# ============================================================================================
+
+nonprod-tf-plan:
+  stage: tf
+  when: manual
+  variables:
+    AWS_ROLE_ARN: $TF_AWS_ROLE_ARN
+  script:
+    - *resolve-tag
+    - cd terraform
+    # image_tag is passed explicitly so the plan never bakes a placeholder into task definitions
+    # (traps.md #2).
+    - terraform plan -var-file="dc/${ENV}/${TF_VARS_FILE}" -var="image_tag=${IMAGE_TAG}" -out=tfplan
+  artifacts:
+    paths: [terraform/tfplan]
+    expire_in: 1 day
+
+nonprod-tf-apply:
+  stage: tf
+  when: manual
+  needs: [nonprod-tf-plan]
+  variables:
+    AWS_ROLE_ARN: $TF_AWS_ROLE_ARN
+  script:
+    - cd terraform
+    # Apply the reviewed PLAN FILE, not a fresh plan. And note: if the TF role is ever denied a read
+    # that `plan` needs, plan fails, no artifact is produced, and this job can never run — the pipeline
+    # cannot repair itself. That takes a human apply (traps.md #8).
+    - terraform apply -input=false tfplan
+
+# ============================================================================================
+# MIGRATE — gates the deploy
+# ============================================================================================
+
+nonprod-migrate:
+  stage: migrate
+  when: manual
+  variables:
+    AWS_ROLE_ARN: $DEPLOY_AWS_ROLE_ARN
+  script:
+    - *resolve-tag
+    - *ecs-helpers
+    - TD_ARN=$(register_revision "${ECS_CLUSTER}-migrate" "${ECR_REGISTRY}/${ENV}/${APP_NAME}-api:${IMAGE_TAG}")
+    # Derive the network config FROM the api service rather than duplicating subnet/SG ids as CI
+    # variables: the migration must run in exactly the subnets and SG that Terraform granted RDS
+    # ingress to, so reading it here means the two can never drift.
+    - |
+      NETCFG=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "${ECS_CLUSTER}-api" \
+        --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)
+      SUBNETS=$(echo "$NETCFG" | jq -r '.subnets | join(",")')
+      SGS=$(echo "$NETCFG" | jq -r '.securityGroups | join(",")')
+      TASK_ARN=$(aws ecs run-task --cluster "$ECS_CLUSTER" --task-definition "$TD_ARN" \
+        --launch-type FARGATE \
+        --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SGS}],assignPublicIp=DISABLED}" \
+        --query 'tasks[0].taskArn' --output text)
+      aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+      EXIT=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+        --query 'tasks[0].containers[0].exitCode' --output text)
+      echo "exitCode=$EXIT"
+      # A failed migration must stop the pipeline BEFORE any service is updated.
+      test "$EXIT" = "0"
+
+# ============================================================================================
+# DEPLOY
+# ============================================================================================
+
+nonprod-deploy:
+  stage: deploy
+  when: manual
+  needs: [nonprod-migrate]
+  variables:
+    AWS_ROLE_ARN: $DEPLOY_AWS_ROLE_ARN
+  script:
+    - *resolve-tag
+    - *ecs-helpers
+    # All services on ONE tag, even if only one image changed. Mixed tags make "what is running?" a
+    # per-service question, and that ambiguity has caused real confusion.
+    - |
+      for COMPONENT in api frontend worker; do
+        IMAGE="${ECR_REGISTRY}/${ENV}/${APP_NAME}-${COMPONENT}:${IMAGE_TAG}"
+        TD_ARN=$(register_revision "${ECS_CLUSTER}-${COMPONENT}" "$IMAGE")
+        aws ecs update-service --cluster "$ECS_CLUSTER" --service "${ECS_CLUSTER}-${COMPONENT}" \
+          --task-definition "$TD_ARN" >/dev/null
+      done
+    # The circuit breaker rolls back on its own; wait so the PIPELINE reflects the outcome rather than
+    # reporting success on a rollout that later reverted.
+    - |
+      aws ecs wait services-stable --cluster "$ECS_CLUSTER" \
+        --services "${ECS_CLUSTER}-api" "${ECS_CLUSTER}-frontend" "${ECS_CLUSTER}-worker"
+      echo "all services stable"
+
+# ============================================================================================
+# SMOKE — read traps.md #10 before touching `needs:` here
+# ============================================================================================
+
+nonprod-smoke:
+  stage: smoke
+  # `optional: true` is a STRUCTURAL guard. nonprod-deploy has no `rules`, so it falls back to
+  # GitLab's default `only: [branches, tags]` and is ABSENT from merge-request pipelines. A bare
+  # `needs: [nonprod-deploy]` makes the whole MR pipeline UNCREATABLE ("0 jobs", yaml invalid) — so
+  # even the `gate` job never runs. It does not weaken the gate: wherever nonprod-deploy exists, smoke
+  # still waits for it and still inherits its skipped/failed state.
+  needs:
+    - job: nonprod-deploy
+      optional: true
+  rules:
+    # Smoke asserts the state of the LIVE deployment. On an unmerged branch it would either report
+    # green for a deploy this pipeline never performed, or red for drift the MR did not cause.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    - when: on_success
+  variables:
+    AWS_ROLE_ARN: $DEPLOY_AWS_ROLE_ARN
+  script:
+    # Control-plane assertions work from anywhere. --output json, NOT text: `text` sorts keys
+    # alphabetically rather than in query order (traps.md #22).
+    - |
+      for COMPONENT in api frontend worker; do
+        aws ecs describe-services --cluster "$ECS_CLUSTER" --services "${ECS_CLUSTER}-${COMPONENT}" \
+          --query 'services[0].{svc:serviceName,running:runningCount,desired:desiredCount,exec:enableExecuteCommand}' \
+          --output json
+      done
+    # One real HTTP assertion against the public edge.
+    - |
+      CODE=$(curl -sS -o /dev/null -w '%{http_code}' "https://${APP_HOSTNAME}/readyz")
+      echo "readyz=$CODE"; test "$CODE" = "200"
+    # State plainly what smoke does NOT cover, so nobody reads green as end-to-end proof:
+    # it does not exercise an authenticated user journey, or the worker's queue path.
+
+# ============================================================================================
+# Before un-gating any AWS job, in this strict order (references/pipeline.md):
+#   1. Terraform state locking + bucket versioning        (traps.md #7)
+#   2. Protected branches + fork-MR pipelines blocked     (traps.md #9)
+#   3. Role ARN variables set, then relax `when: manual`
+# ============================================================================================
